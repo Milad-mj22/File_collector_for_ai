@@ -1,15 +1,13 @@
 """
-File Collector — PySide6 GUI
-============================
+File Collector — PySide6 GUI (v2 — file-level selection)
+========================================================
 - Red/Black theme
-- SQLite storage for projects, folder decisions, and per-project options
-- Cascade checkbox tree (parent -> children auto-toggle, partial-aware)
-- .gitignore awareness — folders ignored by git auto-uncheck in the UI
-- Per-extension selection (tick exactly what you need, e.g. only .tsx)
+- SQLite storage for projects, folder + file decisions, per-project options
+- Cascade checkbox tree (parent <-> children, partial-aware)
+- Per-file selection + per-extension selection
+- .gitignore awareness
 - Output formats: compact (AI-friendly), minimal, verbose
 - Live token estimate
-
-Requirements:  pip install PySide6
 """
 
 import os
@@ -21,8 +19,8 @@ import platform
 import subprocess
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Signal, QPoint
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QIcon, QColor, QBrush
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QLineEdit, QTreeWidget,
@@ -44,7 +42,6 @@ SKIP_DIRS = {
     ".mypy_cache", ".pytest_cache", ".tox", "site-packages",
 }
 
-# File-extension groups — each entry is (group_name, [(ext, default_checked)])
 FILE_TYPE_GROUPS = [
     ("Python",          [(".py", True), (".pyi", True), (".pyx", False)]),
     ("Web / JS / TS",   [(".js", True), (".jsx", True), (".ts", True),
@@ -69,20 +66,18 @@ FILE_TYPE_GROUPS = [
     ("SQL",             [(".sql", True)]),
 ]
 
-# Extensions checked by default for a brand-new project
-DEFAULT_EXTENSIONS = [
-    e for _, items in FILE_TYPE_GROUPS for e, on in items if on
-]
+DEFAULT_EXTENSIONS = [e for _, items in FILE_TYPE_GROUPS for e, on in items if on]
 
 DEFAULT_OPTIONS = {
-    "format_mode": "compact",          # verbose | compact | minimal
+    "format_mode": "compact",
     "skip_empty_init": True,
     "collapse_blank": True,
     "strip_docstrings": False,
     "respect_gitignore": True,
-    "max_file_kb": 0,                  # 0 = no limit
+    "max_file_kb": 0,
     "skip_common_files": True,
     "extensions": list(DEFAULT_EXTENSIONS),
+    "show_all_files": False,   # اگر True: همه فایل‌ها در درخت نمایش داده شوند
 }
 
 DARK_QSS = """
@@ -119,9 +114,7 @@ QPushButton#Success {
 QPushButton#Success:hover { background-color: #248f4a; border-color: #248f4a; }
 QPushButton#Success:disabled { background-color: #1a3a24; border-color: #1a3a24; color: #6a8a72; }
 
-QPushButton#Mini {
-    padding: 3px 10px; font-size: 9pt; border-radius: 6px;
-}
+QPushButton#Mini { padding: 3px 10px; font-size: 9pt; border-radius: 6px; }
 
 QLineEdit, QSpinBox, QComboBox {
     background-color: #0d0d0f; border: 1px solid #34343c; border-radius: 8px;
@@ -147,7 +140,7 @@ QListWidget::item:selected { background-color: #d7263d; color: #ffffff; }
 QTreeWidget {
     background-color: #0d0d0f; border: 1px solid #2a2a30; border-radius: 8px; outline: 0;
 }
-QTreeWidget::item { padding: 4px 2px; }
+QTreeWidget::item { padding: 3px 2px; }
 QTreeWidget::item:hover { background-color: #1a1a1f; }
 QTreeWidget::item:selected { background-color: #3a1418; }
 QTreeWidget::branch { background: transparent; }
@@ -171,16 +164,10 @@ QTreeView::indicator:indeterminate {
 
 QCheckBox { spacing: 8px; color: #d8d8dc; }
 QCheckBox::indicator { width: 16px; height: 16px; border-radius: 3px; }
-QCheckBox::indicator:unchecked {
-    background-color: #0d0d0f; border: 1px solid #34343c;
-}
+QCheckBox::indicator:unchecked { background-color: #0d0d0f; border: 1px solid #34343c; }
 QCheckBox::indicator:unchecked:hover { border-color: #d7263d; }
-QCheckBox::indicator:checked {
-    background-color: #d7263d; border: 1px solid #d7263d;
-}
-QCheckBox::indicator:indeterminate {
-    background-color: #6b1a26; border: 1px solid #d7263d;
-}
+QCheckBox::indicator:checked { background-color: #d7263d; border: 1px solid #d7263d; }
+QCheckBox::indicator:indeterminate { background-color: #6b1a26; border: 1px solid #d7263d; }
 
 QGroupBox {
     border: 1px solid #2a2a30; border-radius: 8px;
@@ -237,14 +224,6 @@ def _matches_ext(fname: str, extensions: set) -> bool:
 
 
 class GitIgnoreMatcher:
-    """Minimal .gitignore matcher. Supports:
-    - comments, blank lines
-    - negation (!)
-    - directory-only patterns (trailing /)
-    - * and ? wildcards
-    - simple ** patterns
-    """
-
     def __init__(self):
         self.patterns = []
 
@@ -349,6 +328,15 @@ class Database:
                     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
                     UNIQUE(project_id, folder_path)
                 );
+
+                CREATE TABLE IF NOT EXISTS file_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    include INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                    UNIQUE(project_id, file_path)
+                );
             """)
 
     def create_project(self, name, root_path, output_file="", options=None):
@@ -379,6 +367,8 @@ class Database:
 
     def delete_project(self, project_id):
         with self._connect() as conn:
+            conn.execute("DELETE FROM file_decisions WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM folder_decisions WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
 
     def get_project(self, project_id):
@@ -428,9 +418,26 @@ class Database:
             ).fetchall()
             return {r["folder_path"]: bool(r["include"]) for r in rows}
 
+    def set_file_decision(self, project_id, file_path, include):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO file_decisions (project_id, file_path, include) VALUES (?, ?, ?) "
+                "ON CONFLICT(project_id, file_path) DO UPDATE SET include = excluded.include",
+                (project_id, file_path, 1 if include else 0),
+            )
+
+    def get_file_decisions(self, project_id):
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT file_path, include FROM file_decisions WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            return {r["file_path"]: bool(r["include"]) for r in rows}
+
     def export_project_json(self, project_id, json_path):
         p = self.get_project(project_id)
         p["folders"] = self.get_folder_decisions(project_id)
+        p["files"] = self.get_file_decisions(project_id)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(p, f, ensure_ascii=False, indent=2)
 
@@ -452,6 +459,8 @@ class Database:
                 name = f"{base_name} ({i})"; i += 1
         for rel, inc in data.get("folders", {}).items():
             self.set_folder_decision(pid, rel, inc)
+        for rel, inc in data.get("files", {}).items():
+            self.set_file_decision(pid, rel, inc)
         return pid
 
 
@@ -460,18 +469,28 @@ class Database:
 # ============================================================
 
 
-def scan_folder_structure(root_dir):
+def scan_tree_entries(root_dir, extensions, show_all_files=False):
+    """Return ordered list of (rel_path, is_dir).
+    Files are included if extension matches (or show_all_files=True)."""
     root_dir = os.path.abspath(root_dir)
+    exts = {e.lower() for e in extensions}
     result = []
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
         rel = os.path.relpath(dirpath, root_dir)
-        result.append("." if rel == "." else rel)
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-    return sorted(result, key=lambda p: (p != ".", p))
+        rel_norm = "." if rel == "." else rel.replace(os.sep, "/")
+        result.append((rel_norm, True))
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+
+        for fname in sorted(filenames):
+            if show_all_files or _matches_ext(fname, exts):
+                frel = fname if rel_norm == "." else f"{rel_norm}/{fname}"
+                result.append((frel, False))
+    return result
 
 
-def count_selected_files(root_dir, include_map, options=None):
+def count_selected_files(root_dir, include_map, options=None, file_map=None):
     options = options or DEFAULT_OPTIONS
+    file_map = file_map or {}
     root_dir = os.path.abspath(root_dir)
     exts = {e.lower() for e in options.get("extensions", DEFAULT_EXTENSIONS)}
     counter = 0
@@ -480,7 +499,7 @@ def count_selected_files(root_dir, include_map, options=None):
 
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
         rel = os.path.relpath(dirpath, root_dir)
-        rel_norm = "." if rel == "." else rel
+        rel_norm = "." if rel == "." else rel.replace(os.sep, "/")
         if rel_norm != "." and include_map.get(rel_norm, True) is False:
             dirnames[:] = []
             continue
@@ -488,6 +507,9 @@ def count_selected_files(root_dir, include_map, options=None):
 
         for fname in filenames:
             if not _matches_ext(fname, exts):
+                continue
+            frel = fname if rel_norm == "." else f"{rel_norm}/{fname}"
+            if file_map.get(frel, True) is False:
                 continue
             fpath = os.path.join(dirpath, fname)
             if max_kb:
@@ -525,8 +547,10 @@ def _strip_docstrings(source):
         return source
 
 
-def collect_python_files(root_dir, output_file, include_map, progress_cb=None, options=None):
+def collect_python_files(root_dir, output_file, include_map, progress_cb=None,
+                         options=None, file_map=None):
     options = options or DEFAULT_OPTIONS
+    file_map = file_map or {}
     root_dir = os.path.abspath(root_dir)
     output_file = os.path.abspath(output_file)
 
@@ -542,7 +566,7 @@ def collect_python_files(root_dir, output_file, include_map, progress_cb=None, o
 
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
         rel = os.path.relpath(dirpath, root_dir)
-        rel_norm = "." if rel == "." else rel
+        rel_norm = "." if rel == "." else rel.replace(os.sep, "/")
         if rel_norm != "." and include_map.get(rel_norm, True) is False:
             skipped_dirs.append(rel_norm)
             dirnames[:] = []
@@ -550,6 +574,9 @@ def collect_python_files(root_dir, output_file, include_map, progress_cb=None, o
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for fname in filenames:
             if _matches_ext(fname, exts):
+                frel = fname if rel_norm == "." else f"{rel_norm}/{fname}"
+                if file_map.get(frel, True) is False:
+                    continue
                 py_files.append(os.path.join(dirpath, fname))
 
     py_files.sort()
@@ -632,7 +659,7 @@ def collect_python_files(root_dir, output_file, include_map, progress_cb=None, o
 
 
 # ============================================================
-# NEW PROJECT DIALOG
+# DIALOGS
 # ============================================================
 
 
@@ -715,11 +742,6 @@ class NewProjectDialog(QDialog):
             return
         self.result_project = self.db.get_project(pid)
         self.accept()
-
-
-# ============================================================
-# TEXT VIEWER DIALOG
-# ============================================================
 
 
 class TextViewerDialog(QDialog):
@@ -860,127 +882,41 @@ class TextViewerDialog(QDialog):
 
 
 # ============================================================
-# HELP DIALOG (Persian FAQ)
+# HELP DIALOG
 # ============================================================
 
-
 FAQ_ITEMS = [
-    (
-        "این برنامه چه کاری انجام می‌دهد؟",
-        "فایل‌های یک پروژه‌ی کدنویسی را در یک <b>فایل متنی واحد</b> جمع می‌کند "
-        "تا بتوانید آن را به هوش مصنوعی (ChatGPT، Claude، Gemini و...) بدهید "
-        "و از کد پروژه سؤال بپرسید یا بازبینی بگیرید."
-    ),
-    (
-        "چطور اولین پروژه را بسازم؟",
-        "۱. روی <b>➕ New</b> در پنل چپ کلیک کنید.<br>"
-        "۲. یک نام برای پروژه وارد کنید.<br>"
-        "۳. روی <b>Browse…</b> کلیک کنید و پوشه‌ی ریشه‌ی کد را انتخاب کنید.<br>"
-        "۴. <b>Create</b> را بزنید."
-    ),
-    (
-        "چطور فقط فایل‌های Python را جمع کنم؟",
-        "در بخش <b>File types</b> روی دکمه‌ی <b>Python</b> کلیک کنید."
-    ),
-    (
-        "چطور فقط یک پسوند خاص (مثلاً .tsx) را انتخاب کنم؟",
-        "در بخش <b>File types</b>، هر پسوند یک چک‌باکس جداگانه دارد. "
-        "کافی است فقط <code>.tsx</code> را تیک بزنید و بقیه را بردارید. "
-        "دکمه‌ی <b>None</b> اول همه را خاموش می‌کند، سپس فقط .tsx را تیک بزنید."
-    ),
-    (
-        "پسوندی که می‌خواهم در لیست نیست (مثل .proto یا .graphql)",
-        "در فیلد <b>Custom</b> وارد کنید و با کاما جدا کنید. نقطه ابتدایی اختیاری است:<br>"
-        "<code>.proto, .graphql, .wgsl, vert, frag</code><br>"
-        "حتی می‌توانید نام فایل کامل بدهید مثل <code>Dockerfile</code> یا <code>Makefile</code>. "
-        "سپس روی <b>Apply</b> بزنید."
-    ),
-    (
-        "دکمه‌ی Apply در بخش Custom چه می‌کند؟",
-        "پسوندهای نوشته‌شده را به لیست اضافه می‌کند و گروه‌های مربوطه را به‌روز می‌کند. "
-        "بدون Apply، ممکن است هنگام reload نادیده گرفته شوند."
-    ),
-    (
-        "منظور از تیک‌های درخت Folders چیست؟",
-        "هر پوشه یک چک‌باکس دارد:<br>"
-        "✅ = شامل شود<br>"
-        "⬜ = حذف شود<br>"
-        "➖ = برخی زیرپوشه‌ها شامل هستند (والد باز می‌ماند، فرزندان فیلتر می‌شوند)<br><br>"
-        "تیک زدن/برداشتن یک پوشه روی همه‌ی زیرپوشه‌هایش اعمال می‌شود (Cascade)."
-    ),
-    (
-        "چرا پوشه‌ای مثل node_modules یا .git در لیست نیست؟",
-        "پوشه‌های سیستمی به‌طور خودکار نادیده گرفته می‌شوند: "
-        "<code>.git</code>، <code>node_modules</code>، <code>__pycache__</code>، "
-        "<code>.venv</code>، <code>venv</code>، <code>build</code>، <code>dist</code>، "
-        "<code>.idea</code>، <code>.vscode</code>، <code>.mypy_cache</code>، "
-        "<code>.pytest_cache</code>، <code>.tox</code>، <code>site-packages</code>."
-    ),
-    (
-        "گزینه‌ی Respect .gitignore چه کار می‌کند؟",
-        "اگر روشن باشد، هر پوشه‌ای که در فایل <code>.gitignore</code> پروژه آمده باشد "
-        "به‌طور خودکار از خروجی حذف می‌شود."
-    ),
-    (
-        "تفاوت Compact / Minimal / Verbose چیست؟",
-        "<b>Compact</b> (پیشنهادی برای AI): هر فایل با <code>### path</code> شروع می‌شود. سبک و خوانا.<br>"
-        "<b>Minimal</b>: کوچک‌ترین حجم، فقط <code># path</code> بالای هر فایل.<br>"
-        "<b>Verbose</b>: مسیر کامل، اندازه و تعداد کاراکتر هر فایل هم نوشته می‌شود (بزرگ‌ترین حجم).<br><br>"
-        "⚠️ توجه: تغییر فرمت فقط در <b>Generate بعدی</b> اعمال می‌شود."
-    ),
-    (
-        "Strip docstrings چیست و چه زمانی استفاده کنم؟",
-        "docstringهای Python را حذف می‌کند. برای کاهش حجم توکن مفید است، "
-        "اما اگر docstringها برای سؤال شما از AI مهم هستند، آن را خاموش بگذارید."
-    ),
-    (
-        "Max file size را چطور تنظیم کنم؟",
-        "حداکثر اندازه‌ی هر فایل. اگر پروژه فایل‌های بزرگ دارد (مثل داده یا minified)، "
-        "مثلاً <code>200 KB</code> بگذارید تا خودکار رد شوند. مقدار <b>0</b> یعنی بدون محدودیت."
-    ),
-    (
-        "حجم توکن چطور محاسبه می‌شود؟",
-        "برنامه یک تخمین ساده می‌زند: <code>تعداد کاراکتر / 4</code>. این تخمین است و "
-        "ممکن است با شمارش دقیق هر مدل کمی فرق کند."
-    ),
-    (
-        "دکمه‌ی Save چه کاری می‌کند؟",
-        "تصمیم‌های پوشه‌ها (شامل/حذف) و تنظیمات (فرمت، پسوندها، اندازه) را در دیتابیس ذخیره می‌کند. "
-        "دکمه‌ی <b>Generate</b> هم به‌طور خودکار تنظیمات فعلی را ذخیره می‌کند."
-    ),
-    (
-        "چرا خروجی خالی است / هیچ فایلی جمع‌آوری نمی‌شود؟",
-        "موارد زیر را بررسی کنید:<br>"
-        "• حداقل یک نوع فایل (پسوند) انتخاب شده باشد.<br>"
-        "• حداقل یک پوشه تیک داشته باشد.<br>"
-        "• پسوند فایل‌های پروژه با انتخاب شما بخواند.<br>"
-        "• Max file size خیلی کوچک نباشد.<br>"
-        "• Respect .gitignore پوشه‌ها را حذف نکرده باشد."
-    ),
-    (
-        "چطور تنظیمات را به سیستم دیگر منتقل کنم؟",
-        "روی <b>⬇ Export</b> بزنید و فایل JSON را ذخیره کنید. در سیستم دیگر "
-        "روی <b>⬆ Import</b> بزنید. توجه: مسیر ریشه‌ی کد باید در سیستم جدید هم موجود باشد."
-    ),
-    (
-        "چطور خروجی را کاهش دهم؟",
-        "۱. <b>Compact</b> را انتخاب کنید (نه Verbose).<br>"
-        "۲. <b>Strip docstrings</b> را روشن کنید.<br>"
-        "۳. <b>Max file size</b> مثلاً ۲۰۰KB بگذارید.<br>"
-        "۴. پوشه‌های تست/مستندات را در درخت حذف کنید.<br>"
-        "۵. اگر پروژه خیلی بزرگ است، در دو مرحله تولید کنید (اول Python، بعد Web)."
-    ),
-    (
-        "چطور خروجی را ببینم؟",
-        "بعد از Generate، روی <b>👁 View Output</b> کلیک کنید. "
-        "می‌توانید جستجو کنید، با برنامه‌ی پیش‌فرض بازش کنید یا مسیرش را کپی کنید."
-    ),
+    ("این برنامه چه کاری انجام می‌دهد؟",
+     "فایل‌های یک پروژه‌ی کدنویسی را در یک <b>فایل متنی واحد</b> جمع می‌کند تا به AI بدهید."),
+    ("چطور فقط یک فایل خاص را انتخاب کنم؟",
+     "در درخت <b>Folders</b>، پوشه‌ها را باز کنید تا فایل‌ها نمایان شوند؛ "
+     "سپس تیک فایل مورد نظر را بردارید/بزنید. والدها به‌صورت خودکار "
+     "وضعیت <b>➖ (partial)</b> می‌گیرند."),
+    ("منظور از تیک‌های درخت چیست؟",
+     "✅ = شامل شود · ⬜ = حذف شود · ➖ = برخی فرزندان شامل هستند.<br>"
+     "تیک زدن/برداشتن روی همه‌ی زیرشاخه‌ها (پوشه و فایل) اعمال می‌شود."),
+    ("چرا بعضی فایل‌ها در درخت نیستند؟",
+     "فقط فایل‌هایی نمایش داده می‌شوند که پسوندشان در بخش <b>File types</b> فعال است. "
+     "برای دیدن همه‌ی فایل‌ها گزینه‌ی <b>Show all files</b> را در تنظیمات روشن کنید."),
+    ("دکمه‌ی Expand / Collapse چه می‌کند؟",
+     "همه‌ی پوشه‌ها را باز یا بسته می‌کند تا سریع‌تر فایل مورد نظر را پیدا کنید."),
+    ("تفاوت Compact / Minimal / Verbose چیست؟",
+     "<b>Compact</b> (پیشنهادی): سرتیتر <code>### path</code>.<br>"
+     "<b>Minimal</b>: فقط <code># path</code>.<br>"
+     "<b>Verbose</b>: مسیر کامل + اندازه."),
+    ("Respect .gitignore چیست؟",
+     "پوشه‌های ذکرشده در <code>.gitignore</code> خودکار غیرفعال و با 🚫 علامت می‌خورند."),
+    ("چرا خروجی خالی است؟",
+     "• حداقل یک پسوند فعال باشد.<br>"
+     "• حداقل یک فایل تیک داشته باشد.<br>"
+     "• Respect .gitignore همه را حذف نکرده باشد.<br>"
+     "• Max file size خیلی کوچک نباشد."),
+    ("چطور تنظیمات را منتقل کنم؟",
+     "دکمه‌ی <b>⬇ Export</b> یک فایل JSON می‌سازد و <b>⬆ Import</b> آن را وارد می‌کند."),
 ]
 
 
 class HelpDialog(QDialog):
-    """Persian FAQ help dialog."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("راهنما — سؤالات متداول")
@@ -997,17 +933,15 @@ class HelpDialog(QDialog):
         title.setObjectName("Title")
         head.addWidget(title)
         head.addStretch()
-
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("جستجو در راهنما…  (مثلاً: پسوند، توکن، gitignore)")
+        self.search_edit.setPlaceholderText("جستجو در راهنما…")
         self.search_edit.setFixedWidth(340)
         self.search_edit.textChanged.connect(self._filter)
         head.addWidget(self.search_edit)
         layout.addLayout(head)
 
         subtitle = QLabel(
-            "این برنامه فایل‌های پروژه را در یک فایل متنی جمع می‌کند تا به هوش مصنوعی بدهید. "
-            "برای پاسخ سریع، از جستجو استفاده کنید یا سؤال مرتبط را باز کنید."
+            "این برنامه فایل‌های پروژه را در یک فایل متنی جمع می‌کند تا به هوش مصنوعی بدهید."
         )
         subtitle.setObjectName("Subtitle")
         subtitle.setWordWrap(True)
@@ -1037,7 +971,6 @@ class HelpDialog(QDialog):
         self.count_lbl.setObjectName("Subtitle")
         foot.addWidget(self.count_lbl)
         foot.addStretch()
-
         expand_all = QPushButton("باز کردن همه")
         expand_all.clicked.connect(lambda: self._set_all(True))
         collapse_all = QPushButton("بستن همه")
@@ -1045,18 +978,16 @@ class HelpDialog(QDialog):
         close_btn = QPushButton("بستن")
         close_btn.setObjectName("Primary")
         close_btn.clicked.connect(self.accept)
-
         foot.addWidget(expand_all)
         foot.addWidget(collapse_all)
         foot.addWidget(close_btn)
         layout.addLayout(foot)
 
-    def _make_faq_item(self, question: str, answer_html: str):
+    def _make_faq_item(self, question, answer_html):
         btn = QPushButton(("▸  " + question))
         btn.setObjectName("FaqQuestion")
         btn.setCheckable(True)
         btn.setCursor(Qt.PointingHandCursor)
-
         body = QLabel(answer_html)
         body.setObjectName("FaqAnswer")
         body.setWordWrap(True)
@@ -1070,7 +1001,7 @@ class HelpDialog(QDialog):
         btn.toggled.connect(toggle)
         return btn, body
 
-    def _filter(self, text: str):
+    def _filter(self, text):
         text = text.strip().lower()
         visible = 0
         for q_lower, btn, body in self._faq_widgets:
@@ -1083,8 +1014,8 @@ class HelpDialog(QDialog):
                 body.setVisible(False)
         self.count_lbl.setText(f"{visible} سؤال")
 
-    def _set_all(self, on: bool):
-        for q_lower, btn, body in self._faq_widgets:
+    def _set_all(self, on):
+        for _, btn, _ in self._faq_widgets:
             if btn.isVisible():
                 btn.setChecked(on)
 
@@ -1116,7 +1047,6 @@ QLabel#FaqAnswer {
     padding: 12px 16px;
     color: #d0d0d6;
     margin: 0 0 6px 0;
-    line-height: 150%;
 }
 """
 
@@ -1127,17 +1057,13 @@ QLabel#FaqAnswer {
 
 
 class DarkTitleBar(QWidget):
-    """Custom draggable title bar matching our red/black theme."""
     def __init__(self, parent_window):
         super().__init__(parent_window)
         self._win = parent_window
         self._drag_pos = None
         self.setFixedHeight(38)
         self.setStyleSheet("""
-            DarkTitleBar {
-                background-color: #0a0a0c;
-                border-bottom: 1px solid #2a2a30;
-            }
+            DarkTitleBar { background-color: #0a0a0c; border-bottom: 1px solid #2a2a30; }
             QLabel { color: #e8e8ea; font-weight: 600; padding-left: 6px; }
             QPushButton {
                 background: transparent; color: #e8e8ea;
@@ -1215,19 +1141,19 @@ class CollectorWindow(QMainWindow):
         self.projects = []
         self.current_project = None
         self.folder_decisions = {}
+        self.file_decisions = {}
         self.gitignored = set()
-        self.items = {}
+        self.items = {}         # rel_path -> QTreeWidgetItem (folders)
+        self.file_items = {}    # rel_path -> QTreeWidgetItem (files)
         self._updating_tree = False
         self._loading_options = False
         self.git_matcher = None
 
-        # ext -> QCheckBox
         self.ext_checks = {}
 
         self._build_ui()
         self._refresh_projects()
         self.status_msg.connect(lambda m: self.statusBar().showMessage(m))
-
         self._build_frameless_layout()
 
     # ---------------- UI ----------------
@@ -1238,12 +1164,11 @@ class CollectorWindow(QMainWindow):
         root.setContentsMargins(14, 14, 14, 10)
         root.setSpacing(10)
 
-        # ---------- Header (full width) ----------
+        # Header
         header = QHBoxLayout()
         logo_lbl = QLabel()
         if os.path.isfile(ICON_PATH):
-            pix = QIcon(ICON_PATH).pixmap(24, 24)
-            logo_lbl.setPixmap(pix)
+            logo_lbl.setPixmap(QIcon(ICON_PATH).pixmap(24, 24))
             logo_lbl.setFixedSize(24, 24)
         header.addWidget(logo_lbl)
 
@@ -1264,14 +1189,12 @@ class CollectorWindow(QMainWindow):
         header.addWidget(self.header_sub)
         root.addLayout(header)
 
-        # ---------- Three-column splitter ----------
+        # Splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         root.addWidget(splitter, 1)
 
-        # =========================================================
-        # COLUMN 1 — Projects
-        # =========================================================
+        # ---- Column 1: Projects ----
         col_projects = QFrame(); col_projects.setObjectName("Card")
         col_projects.setMinimumWidth(220)
         col_projects.setMaximumWidth(360)
@@ -1307,67 +1230,84 @@ class CollectorWindow(QMainWindow):
         splitter.addWidget(col_projects)
         splitter.setStretchFactor(0, 0)
 
-        # =========================================================
-        # COLUMN 2 — Folders (full height)
-        # =========================================================
-        col_folders = QFrame(); col_folders.setObjectName("Card")
-        col_folders.setMinimumWidth(280)
-        f_l = QVBoxLayout(col_folders)
-        f_l.setContentsMargins(12, 12, 12, 12)
-        f_l.setSpacing(8)
+        # ---- Column 2: Tree (folders + files) ----
+        col_tree = QFrame(); col_tree.setObjectName("Card")
+        col_tree.setMinimumWidth(360)
+        t_l = QVBoxLayout(col_tree)
+        t_l.setContentsMargins(12, 12, 12, 12)
+        t_l.setSpacing(8)
 
         tree_header = QHBoxLayout()
-        tree_title = QLabel("Folders"); tree_title.setObjectName("SectionTitle")
+        tree_title = QLabel("Files & Folders")
+        tree_title.setObjectName("SectionTitle")
         tree_header.addWidget(tree_title)
         tree_header.addStretch()
         self.lbl_stats = QLabel("")
         self.lbl_stats.setObjectName("Subtitle")
         tree_header.addWidget(self.lbl_stats)
-        f_l.addLayout(tree_header)
+        t_l.addLayout(tree_header)
+
+        # quick tree action bar
+        tree_tools = QHBoxLayout()
+        self.btn_expand = QPushButton("⊞  Expand")
+        self.btn_collapse = QPushButton("⊟  Collapse")
+        self.btn_check_all = QPushButton("✓  All")
+        self.btn_check_none = QPushButton("✗  None")
+        for b in (self.btn_expand, self.btn_collapse,
+                  self.btn_check_all, self.btn_check_none):
+            b.setObjectName("Mini")
+        self.btn_expand.clicked.connect(lambda: self.tree.expandAll())
+        self.btn_collapse.clicked.connect(lambda: self.tree.collapseAll())
+        self.btn_check_all.clicked.connect(lambda: self._set_all_tree(True))
+        self.btn_check_none.clicked.connect(lambda: self._set_all_tree(False))
+        tree_tools.addWidget(self.btn_expand)
+        tree_tools.addWidget(self.btn_collapse)
+        tree_tools.addSpacing(12)
+        tree_tools.addWidget(self.btn_check_all)
+        tree_tools.addWidget(self.btn_check_none)
+        tree_tools.addStretch()
+        t_l.addLayout(tree_tools)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Folder", "In", "gitignore"])
-        self.tree.setColumnWidth(0, 220)
+        self.tree.setHeaderLabels(["Name", "Sel", "gitignore"])
+        self.tree.setColumnWidth(0, 280)
         self.tree.setColumnWidth(1, 46)
         self.tree.setColumnWidth(2, 90)
         self.tree.setUniformRowHeights(True)
         self.tree.setSelectionMode(QAbstractItemView.NoSelection)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
-        f_l.addWidget(self.tree, 1)
+        self.tree.itemExpanded.connect(self._on_item_expanded)
+        t_l.addWidget(self.tree, 1)
 
         tree_actions = QHBoxLayout()
         self.btn_rescan = QPushButton("🔄  Rescan")
-        self.btn_rescan.clicked.connect(lambda: self._rescan_folders())
+        self.btn_rescan.clicked.connect(lambda: self._rescan_tree())
         self.btn_save = QPushButton("💾  Save")
         self.btn_save.clicked.connect(self._save_settings)
         tree_actions.addWidget(self.btn_rescan)
         tree_actions.addWidget(self.btn_save)
         tree_actions.addStretch()
-        f_l.addLayout(tree_actions)
+        t_l.addLayout(tree_actions)
 
-        splitter.addWidget(col_folders)
-        splitter.setStretchFactor(1, 1)
+        splitter.addWidget(col_tree)
+        splitter.setStretchFactor(1, 2)
 
-        # =========================================================
-        # COLUMN 3 — Settings + output
-        # =========================================================
+        # ---- Column 3: Settings ----
         col_settings = QFrame(); col_settings.setObjectName("Card")
         col_settings.setMinimumWidth(420)
         s_l = QVBoxLayout(col_settings)
         s_l.setContentsMargins(14, 14, 14, 14)
         s_l.setSpacing(10)
 
-        # project info
         info = QFrame()
         info_l = QVBoxLayout(info)
         info_l.setContentsMargins(0, 0, 0, 0)
         info_l.setSpacing(6)
         self.lbl_name = self._info_row(info_l, "Name", editable=True)
         self.lbl_root = self._info_row(info_l, "Root", editable=False)
-        self.lbl_out  = self._info_row(info_l, "Output", editable=True, with_browse=True)
+        self.lbl_out = self._info_row(info_l, "Output", editable=True, with_browse=True)
         s_l.addWidget(info)
 
-        # scrollable settings area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -1376,7 +1316,7 @@ class CollectorWindow(QMainWindow):
         sc_l.setContentsMargins(0, 0, 0, 0)
         sc_l.setSpacing(10)
 
-        # ---- OUTPUT OPTIONS ----
+        # output options
         opts_box = QGroupBox("Output options")
         opts_l = QVBoxLayout(opts_box)
         opts_l.setSpacing(6)
@@ -1410,7 +1350,7 @@ class CollectorWindow(QMainWindow):
         self.chk_skip_init.stateChanged.connect(self._on_option_changed)
         self.chk_collapse = QCheckBox("Collapse extra blank lines")
         self.chk_collapse.stateChanged.connect(self._on_option_changed)
-        self.chk_strip_doc = QCheckBox("Strip docstrings (may change formatting)")
+        self.chk_strip_doc = QCheckBox("Strip docstrings")
         self.chk_strip_doc.stateChanged.connect(self._on_option_changed)
         opts_l.addWidget(self.chk_skip_init)
         opts_l.addWidget(self.chk_collapse)
@@ -1419,6 +1359,11 @@ class CollectorWindow(QMainWindow):
         self.chk_gitignore = QCheckBox("Respect .gitignore")
         self.chk_gitignore.stateChanged.connect(self._on_gitignore_toggled)
         opts_l.addWidget(self.chk_gitignore)
+
+        self.chk_show_all = QCheckBox("Show all files (ignore extension filter in tree)")
+        self.chk_show_all.stateChanged.connect(self._on_show_all_toggled)
+        opts_l.addWidget(self.chk_show_all)
+
         self.gitignore_status = QLabel("")
         self.gitignore_status.setObjectName("Subtitle")
         self.gitignore_status.setWordWrap(True)
@@ -1426,21 +1371,20 @@ class CollectorWindow(QMainWindow):
 
         sc_l.addWidget(opts_box)
 
-        # ---- FILE TYPES ----
+        # file types
         types_box = QGroupBox("File types")
         types_l = QVBoxLayout(types_box)
         types_l.setSpacing(6)
 
         quick_row = QHBoxLayout()
-        self.btn_types_all     = QPushButton("All")
-        self.btn_types_none    = QPushButton("None")
-        self.btn_types_py      = QPushButton("Python")
-        self.btn_types_web     = QPushButton("Web")
+        self.btn_types_all = QPushButton("All")
+        self.btn_types_none = QPushButton("None")
+        self.btn_types_py = QPushButton("Python")
+        self.btn_types_web = QPushButton("Web")
         self.btn_types_web_tsx = QPushButton("TSX")
         self.btn_types_all.clicked.connect(lambda: self._set_all_types(True))
         self.btn_types_none.clicked.connect(lambda: self._set_all_types(False))
-        self.btn_types_py.clicked.connect(lambda: self._select_only(
-            [".py", ".pyi", ".pyx"]))
+        self.btn_types_py.clicked.connect(lambda: self._select_only([".py", ".pyi", ".pyx"]))
         self.btn_types_web.clicked.connect(lambda: self._select_only(
             [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
              ".html", ".htm", ".css", ".scss"]))
@@ -1452,7 +1396,6 @@ class CollectorWindow(QMainWindow):
         quick_row.addStretch()
         types_l.addLayout(quick_row)
 
-        # per-extension checkboxes in a grid
         grid_wrap = QWidget()
         grid = QGridLayout(grid_wrap)
         grid.setContentsMargins(0, 0, 0, 0)
@@ -1465,9 +1408,8 @@ class CollectorWindow(QMainWindow):
             g_lbl.setStyleSheet("color: #d7263d; font-weight: 600; margin-top: 6px;")
             grid.addWidget(g_lbl, row_i, 0, 1, 4)
             row_i += 1
-
             col_i = 0
-            for ext, _default_on in exts:
+            for ext, _ in exts:
                 cb = QCheckBox(ext)
                 cb.stateChanged.connect(self._on_ext_option_changed)
                 self.ext_checks[ext] = cb
@@ -1478,7 +1420,6 @@ class CollectorWindow(QMainWindow):
                     row_i += 1
             if col_i != 0:
                 row_i += 1
-
         types_l.addWidget(grid_wrap)
 
         custom_row = QHBoxLayout()
@@ -1489,7 +1430,6 @@ class CollectorWindow(QMainWindow):
         self.custom_ext_edit.textChanged.connect(self._on_ext_option_changed)
         self.btn_apply_custom = QPushButton("Apply")
         self.btn_apply_custom.setObjectName("Mini")
-        self.btn_apply_custom.setToolTip("Add typed extensions to the checked list")
         self.btn_apply_custom.clicked.connect(self._apply_custom_extensions)
         custom_row.addWidget(custom_lbl)
         custom_row.addWidget(self.custom_ext_edit, 1)
@@ -1507,7 +1447,6 @@ class CollectorWindow(QMainWindow):
         scroll.setWidget(scroll_content)
         s_l.addWidget(scroll, 1)
 
-        # ---- bottom actions ----
         actions = QHBoxLayout()
         self.btn_view = QPushButton("👁  View Output")
         self.btn_view.setObjectName("Success")
@@ -1530,11 +1469,8 @@ class CollectorWindow(QMainWindow):
 
         splitter.addWidget(col_settings)
         splitter.setStretchFactor(2, 1)
+        splitter.setSizes([260, 500, 600])
 
-        # proportions: [projects, folders, settings]
-        splitter.setSizes([280, 420, 560])
-
-        # ---- status bar ----
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready.")
         self._set_enabled_for_project(False)
@@ -1573,16 +1509,17 @@ class CollectorWindow(QMainWindow):
         central.setLayout(new_outer)
 
     def _open_help(self):
-        dlg = HelpDialog(self)
-        dlg.exec()
+        HelpDialog(self).exec()
 
     def _set_enabled_for_project(self, enabled):
         for w in (self.tree, self.btn_rescan, self.btn_save, self.btn_generate,
                   self.lbl_out, self.btn_export, self.format_combo, self.max_kb_spin,
                   self.chk_skip_init, self.chk_collapse, self.chk_strip_doc,
-                  self.chk_gitignore, self.custom_ext_edit, self.btn_apply_custom,
-                  self.btn_types_all, self.btn_types_none,
-                  self.btn_types_py, self.btn_types_web, self.btn_types_web_tsx):
+                  self.chk_gitignore, self.chk_show_all, self.custom_ext_edit,
+                  self.btn_apply_custom, self.btn_types_all, self.btn_types_none,
+                  self.btn_types_py, self.btn_types_web, self.btn_types_web_tsx,
+                  self.btn_expand, self.btn_collapse,
+                  self.btn_check_all, self.btn_check_none):
             w.setEnabled(enabled)
         for cb in self.ext_checks.values():
             cb.setEnabled(enabled)
@@ -1593,7 +1530,7 @@ class CollectorWindow(QMainWindow):
             self.btn_view.setEnabled(False)
 
     # ---------------- EXTENSIONS ----------------
-    def _normalize_ext(self, s: str) -> str:
+    def _normalize_ext(self, s):
         s = s.strip().lower()
         if not s:
             return ""
@@ -1602,7 +1539,6 @@ class CollectorWindow(QMainWindow):
         return s
 
     def _current_extensions(self):
-        """Read every checked extension from UI + custom field."""
         exts = set()
         for ext, cb in self.ext_checks.items():
             if cb.isChecked():
@@ -1614,29 +1550,22 @@ class CollectorWindow(QMainWindow):
         return sorted(exts)
 
     def _apply_extensions_to_ui(self, extensions):
-        """Set checkboxes + custom field to reflect the given extension set."""
         ext_set = {e.lower() for e in (extensions or [])}
-
         for ext, cb in self.ext_checks.items():
             cb.blockSignals(True)
             cb.setChecked(ext.lower() in ext_set)
             cb.blockSignals(False)
-
-        # Anything unknown goes into the custom field
         known = {e.lower() for e in self.ext_checks}
         leftovers = sorted(ext_set - known)
         self.custom_ext_edit.blockSignals(True)
         self.custom_ext_edit.setText(", ".join(leftovers))
         self.custom_ext_edit.blockSignals(False)
-
         self._update_ext_summary()
 
     def _update_ext_summary(self):
         exts = self._current_extensions()
         if not exts:
-            self.ext_summary_lbl.setText(
-                "⚠️  no extensions selected — nothing will be collected"
-            )
+            self.ext_summary_lbl.setText("⚠️  no extensions selected — nothing will be collected")
             self.ext_summary_lbl.setStyleSheet("color: #ff6b7a;")
         else:
             preview = ", ".join(exts[:16])
@@ -1651,7 +1580,9 @@ class CollectorWindow(QMainWindow):
             return
         self._update_ext_summary()
         self._persist_options()
-        self._update_stats()
+        # Rebuild tree since visible files depend on extensions
+        if self.current_project:
+            self._rescan_tree(silent=True)
 
     def _apply_custom_extensions(self):
         raw = self.custom_ext_edit.text()
@@ -1671,9 +1602,7 @@ class CollectorWindow(QMainWindow):
             cb.setChecked(on)
             cb.blockSignals(False)
         self._loading_options = False
-        self._update_ext_summary()
-        self._persist_options()
-        self._update_stats()
+        self._on_ext_option_changed()
 
     def _select_only(self, exts):
         wanted = {e.lower() for e in exts}
@@ -1715,6 +1644,7 @@ class CollectorWindow(QMainWindow):
         )
         self.lbl_out.setText(out)
         self.folder_decisions = self.db.get_folder_decisions(project["id"])
+        self.file_decisions = self.db.get_file_decisions(project["id"])
 
         self._loading_options = True
         opts = project.get("options") or DEFAULT_OPTIONS.copy()
@@ -1725,7 +1655,7 @@ class CollectorWindow(QMainWindow):
         self.chk_collapse.setChecked(bool(opts.get("collapse_blank", True)))
         self.chk_strip_doc.setChecked(bool(opts.get("strip_docstrings", False)))
         self.chk_gitignore.setChecked(bool(opts.get("respect_gitignore", True)))
-
+        self.chk_show_all.setChecked(bool(opts.get("show_all_files", False)))
         saved_exts = opts.get("extensions")
         if saved_exts is None or not isinstance(saved_exts, list):
             saved_exts = DEFAULT_EXTENSIONS
@@ -1734,7 +1664,7 @@ class CollectorWindow(QMainWindow):
 
         self._set_enabled_for_project(True)
         self.header_sub.setText(f"Root: {project['root_path']}")
-        self._rescan_folders(silent=True)
+        self._rescan_tree(silent=True)
 
     def _new_project(self):
         dlg = NewProjectDialog(self.db, self)
@@ -1759,8 +1689,11 @@ class CollectorWindow(QMainWindow):
         self.db.delete_project(self.current_project["id"])
         self.current_project = None
         self.folder_decisions.clear()
+        self.file_decisions.clear()
         self.gitignored.clear()
-        self.tree.clear(); self.items.clear()
+        self.tree.clear()
+        self.items.clear()
+        self.file_items.clear()
         self.lbl_name.clear(); self.lbl_root.clear(); self.lbl_out.clear()
         self._set_enabled_for_project(False)
         self._refresh_projects()
@@ -1780,9 +1713,7 @@ class CollectorWindow(QMainWindow):
         self.statusBar().showMessage(f"Exported to {path}")
 
     def _import_json(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import project", "", "JSON (*.json)"
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Import project", "", "JSON (*.json)")
         if not path:
             return
         try:
@@ -1807,6 +1738,7 @@ class CollectorWindow(QMainWindow):
             "respect_gitignore": self.chk_gitignore.isChecked(),
             "max_file_kb": self.max_kb_spin.value(),
             "skip_common_files": True,
+            "show_all_files": self.chk_show_all.isChecked(),
             "extensions": self._current_extensions(),
         }
 
@@ -1817,6 +1749,13 @@ class CollectorWindow(QMainWindow):
         self._apply_gitignore_to_tree()
         self._update_stats()
 
+    def _on_show_all_toggled(self, *args):
+        if self._loading_options:
+            return
+        self._persist_options()
+        if self.current_project:
+            self._rescan_tree(silent=True)
+
     def _on_gitignore_toggled(self, *args):
         if self._loading_options:
             return
@@ -1824,9 +1763,8 @@ class CollectorWindow(QMainWindow):
             self.gitignored.clear()
             if self.current_project:
                 self.folder_decisions = self.db.get_folder_decisions(self.current_project["id"])
-            self._apply_gitignore_to_tree()
-        else:
-            self._apply_gitignore_to_tree()
+                self.file_decisions = self.db.get_file_decisions(self.current_project["id"])
+        self._apply_gitignore_to_tree()
         self._persist_options()
         self._update_stats()
 
@@ -1874,28 +1812,40 @@ class CollectorWindow(QMainWindow):
         if not self.current_project:
             return
         respect = self.chk_gitignore.isChecked()
-        base = self.db.get_folder_decisions(self.current_project["id"])
-        effective = dict(base)
+
+        # combine DB + gitignore override (in memory only)
+        base_dirs = self.db.get_folder_decisions(self.current_project["id"])
+        base_files = self.db.get_file_decisions(self.current_project["id"])
+        eff_dirs = dict(base_dirs)
+        eff_files = dict(base_files)
         for rel in self.gitignored:
             if respect:
-                effective[rel] = False
+                eff_dirs[rel] = False
 
-        self.folder_decisions = effective
+        self.folder_decisions = eff_dirs
+        self.file_decisions = eff_files
 
         self._updating_tree = True
         for rel, item in self.items.items():
-            if rel in self.gitignored and respect:
+            if respect and rel in self.gitignored:
                 item.setCheckState(0, Qt.Unchecked)
-                item.setForeground(1, Qt.GlobalColor.gray)
+                item.setText(1, "🚫")
+                item.setForeground(2, QBrush(QColor("#ff6b7a")))
                 item.setText(2, "🚫 ignored")
             else:
-                inc = effective.get(rel, True)
+                inc = eff_dirs.get(rel, True)
                 item.setCheckState(0, Qt.Checked if inc else Qt.Unchecked)
-                item.setForeground(1, Qt.GlobalColor.white)
+                item.setForeground(2, QBrush(QColor("#8a8a92")))
                 item.setText(2, "")
+        for rel, item in self.file_items.items():
+            if respect and rel in self.gitignored:
+                item.setCheckState(0, Qt.Unchecked)
+            else:
+                inc = eff_files.get(rel, True)
+                item.setCheckState(0, Qt.Checked if inc else Qt.Unchecked)
         self._updating_tree = False
 
-        # Re-propagate partial states upward (bottom-up order)
+        # recompute partials bottom-up
         self._updating_tree = True
         for rel in sorted(self.items.keys(), reverse=True):
             item = self.items[rel]
@@ -1906,8 +1856,8 @@ class CollectorWindow(QMainWindow):
         self._refresh_check_states_display()
         self._update_stats()
 
-    # ---------------- FOLDER TREE ----------------
-    def _rescan_folders(self, silent=False):
+    # ---------------- TREE ----------------
+    def _rescan_tree(self, silent=False):
         if not self.current_project:
             return
         root = self.current_project["root_path"]
@@ -1916,45 +1866,64 @@ class CollectorWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Root folder not found:\n{root}")
             return
         if not silent:
-            self.statusBar().showMessage("Scanning folders…")
+            self.statusBar().showMessage("Scanning tree…")
         QApplication.processEvents()
 
         self._load_gitignore()
-        folders = scan_folder_structure(root)
+        exts = self._current_extensions()
+        show_all = self.chk_show_all.isChecked()
+        entries = scan_tree_entries(root, exts, show_all_files=show_all)
+
+        # preserve expansion state
+        expanded = {rel for rel, item in self.items.items() if item.isExpanded()}
 
         self.tree.blockSignals(True)
         self.tree.clear()
         self.items.clear()
+        self.file_items.clear()
         self._updating_tree = True
 
-        for rel in folders:
+        for rel, is_dir in entries:
             if rel == ".":
                 parent = None
                 label = os.path.basename(root) or "(root)"
             else:
-                parent_rel = os.sep.join(rel.split(os.sep)[:-1])
-                parent = self.items.get(parent_rel) if parent_rel else self.items.get(".")
-                label = rel.split(os.sep)[-1]
+                parent_rel = "/".join(rel.split("/")[:-1]) or "."
+                parent = self.items.get(parent_rel)
+                label = rel.split("/")[-1]
 
-            item = QTreeWidgetItem([label, "", ""])
-            item.setData(0, Qt.UserRole, rel)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            include = self.folder_decisions.get(rel, True)
-            item.setCheckState(0, Qt.Checked if include else Qt.Unchecked)
-
-            if parent is not None:
-                parent.addChild(item)
+            if is_dir:
+                item = QTreeWidgetItem([f"📁 {label}", "", ""])
+                item.setData(0, Qt.UserRole, rel)
+                item.setData(0, Qt.UserRole + 1, "dir")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                include = self.folder_decisions.get(rel, True)
+                item.setCheckState(0, Qt.Checked if include else Qt.Unchecked)
+                if parent is not None:
+                    parent.addChild(item)
+                else:
+                    self.tree.addTopLevelItem(item)
+                self.items[rel] = item
+                # expand if root, previously expanded, or (no expansion state yet)
+                if rel == "." or rel in expanded or not expanded:
+                    item.setExpanded(True)
             else:
-                self.tree.addTopLevelItem(item)
-            self.items[rel] = item
-            item.setExpanded(True)
+                item = QTreeWidgetItem([f"📄 {label}", "", ""])
+                item.setData(0, Qt.UserRole, rel)
+                item.setData(0, Qt.UserRole + 1, "file")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                include = self.file_decisions.get(rel, True)
+                item.setCheckState(0, Qt.Checked if include else Qt.Unchecked)
+                item.setForeground(0, QBrush(QColor("#c8c8d0")))
+                if parent is not None:
+                    parent.addChild(item)
+                self.file_items[rel] = item
 
         self.tree.blockSignals(False)
         self._updating_tree = False
 
         self._apply_gitignore_to_tree()
 
-        # Recompute parents' partial state from children (bottom-up)
         self._updating_tree = True
         for rel in sorted(self.items.keys(), reverse=True):
             item = self.items[rel]
@@ -1963,9 +1932,15 @@ class CollectorWindow(QMainWindow):
         self._updating_tree = False
 
         self._refresh_check_states_display()
-
         if not silent:
-            self.statusBar().showMessage(f"Scanned {len(folders)} folders.")
+            n_files = len(self.file_items)
+            self.statusBar().showMessage(
+                f"Scanned {len(self.items)} folders, {n_files} files."
+            )
+
+    def _on_item_expanded(self, item):
+        # اینجا کاری لازم نیست اما اگر lazy-load خواستید می‌توانید اینجا اضافه کنید
+        pass
 
     def _refresh_check_states_display(self):
         for rel, item in self.items.items():
@@ -1976,11 +1951,38 @@ class CollectorWindow(QMainWindow):
                 item.setText(1, "⬜")
             else:
                 item.setText(1, "➖")
+        for rel, item in self.file_items.items():
+            state = item.checkState(0)
+            if state == Qt.Checked:
+                item.setText(1, "✅")
+            elif state == Qt.Unchecked:
+                item.setText(1, "⬜")
+            else:
+                item.setText(1, "➖")
+
+    def _set_all_tree(self, on):
+        if not self.current_project:
+            return
+        self._updating_tree = True
+        for rel, item in self.items.items():
+            if on and self.chk_gitignore.isChecked() and rel in self.gitignored:
+                item.setCheckState(0, Qt.Unchecked)
+                self.folder_decisions[rel] = False
+            else:
+                item.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+                self.folder_decisions[rel] = bool(on)
+        for rel, item in self.file_items.items():
+            item.setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+            self.file_decisions[rel] = bool(on)
+        self._updating_tree = False
+        self._refresh_check_states_display()
+        self._update_stats()
 
     def _on_tree_item_changed(self, item, column):
         if self._updating_tree or column != 0:
             return
         rel = item.data(0, Qt.UserRole)
+        kind = item.data(0, Qt.UserRole + 1)
         state = item.checkState(0)
 
         if self.chk_gitignore.isChecked() and rel in self.gitignored:
@@ -1991,10 +1993,13 @@ class CollectorWindow(QMainWindow):
             return
 
         self._updating_tree = True
-        # Checked AND PartiallyChecked both mean "walk into this folder"
-        self.folder_decisions[rel] = (state != Qt.Unchecked)
-        self._set_children_state(item, state)
-        self._propagate_upwards(item.parent())
+        if kind == "file":
+            self.file_decisions[rel] = (state == Qt.Checked)
+            self._propagate_upwards(item.parent())
+        else:
+            self.folder_decisions[rel] = (state != Qt.Unchecked)
+            self._set_children_state(item, state)
+            self._propagate_upwards(item.parent())
         self._updating_tree = False
 
         self._refresh_check_states_display()
@@ -2006,13 +2011,22 @@ class CollectorWindow(QMainWindow):
         for i in range(item.childCount()):
             child = item.child(i)
             crel = child.data(0, Qt.UserRole)
+            kind = child.data(0, Qt.UserRole + 1)
+
             if self.chk_gitignore.isChecked() and crel in self.gitignored:
                 child.setCheckState(0, Qt.Unchecked)
-                self.folder_decisions[crel] = False
+                if kind == "dir":
+                    self.folder_decisions[crel] = False
+                else:
+                    self.file_decisions[crel] = False
             else:
                 child.setCheckState(0, state)
-                self.folder_decisions[crel] = (state == Qt.Checked)
-            self._set_children_state(child, state)
+                if kind == "dir":
+                    self.folder_decisions[crel] = (state == Qt.Checked)
+                else:
+                    self.file_decisions[crel] = (state == Qt.Checked)
+            if kind == "dir":
+                self._set_children_state(child, state)
 
     def _propagate_upwards(self, item):
         while item is not None:
@@ -2030,8 +2044,7 @@ class CollectorWindow(QMainWindow):
                 self.folder_decisions[rel] = True
             else:
                 item.setCheckState(0, Qt.PartiallyChecked)
-                # IMPORTANT: partial = keep walking into this folder
-                self.folder_decisions[rel] = True
+                self.folder_decisions[rel] = True  # keep walking in
             item = item.parent()
 
     def _update_stats(self):
@@ -2039,9 +2052,12 @@ class CollectorWindow(QMainWindow):
             return
         opts = self._current_options()
         n = count_selected_files(
-            self.current_project["root_path"], self.folder_decisions, opts
+            self.current_project["root_path"], self.folder_decisions, opts,
+            file_map=self.file_decisions,
         )
-        self.lbl_stats.setText(f"{n} file(s) selected")
+        n_folders = len(self.items)
+        n_files = len(self.file_items)
+        self.lbl_stats.setText(f"{n} selected · {n_folders} folders · {n_files} files shown")
         self.btn_view.setEnabled(
             bool(self.lbl_out.text() and os.path.isfile(self.lbl_out.text()))
         )
@@ -2064,6 +2080,8 @@ class CollectorWindow(QMainWindow):
             return
         for rel, inc in self.folder_decisions.items():
             self.db.set_folder_decision(self.current_project["id"], rel, inc)
+        for rel, inc in self.file_decisions.items():
+            self.db.set_file_decision(self.current_project["id"], rel, inc)
         self.db.update_project(
             self.current_project["id"],
             output_file=self.lbl_out.text(),
@@ -2078,7 +2096,7 @@ class CollectorWindow(QMainWindow):
                 self.current_project = p
                 break
         self.statusBar().showMessage("Settings saved.")
-        QMessageBox.information(self, "Saved", "Folder decisions and options saved.")
+        QMessageBox.information(self, "Saved", "Folder/file decisions and options saved.")
 
     def _generate(self):
         if not self.current_project:
@@ -2090,15 +2108,14 @@ class CollectorWindow(QMainWindow):
 
         opts = self._current_options()
         if not opts.get("extensions"):
-            QMessageBox.warning(self, "Missing",
-                                "Please select at least one file type.")
+            QMessageBox.warning(self, "Missing", "Please select at least one file type.")
             return
 
         for rel, inc in self.folder_decisions.items():
             self.db.set_folder_decision(self.current_project["id"], rel, inc)
-        self.db.update_project(
-            self.current_project["id"], output_file=out, options=opts
-        )
+        for rel, inc in self.file_decisions.items():
+            self.db.set_file_decision(self.current_project["id"], rel, inc)
+        self.db.update_project(self.current_project["id"], output_file=out, options=opts)
 
         self.progress.setVisible(True)
         self.progress.setValue(0)
@@ -2112,7 +2129,7 @@ class CollectorWindow(QMainWindow):
         try:
             n, size, skipped = collect_python_files(
                 self.current_project["root_path"], out, self.folder_decisions,
-                progress_cb=cb, options=opts,
+                progress_cb=cb, options=opts, file_map=self.file_decisions,
             )
         except Exception as e:
             self.progress.setVisible(False)
@@ -2146,8 +2163,7 @@ class CollectorWindow(QMainWindow):
             QMessageBox.warning(self, "Missing",
                                 "No output file yet. Please generate it first.")
             return
-        dlg = TextViewerDialog(path, self)
-        dlg.exec()
+        TextViewerDialog(path, self).exec()
 
 
 # ============================================================
@@ -2155,8 +2171,7 @@ class CollectorWindow(QMainWindow):
 # ============================================================
 
 
-def resource_path(rel_path: str) -> str:
-    """Resolve a bundled resource path — works in dev and in PyInstaller onefile."""
+def resource_path(rel_path):
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, rel_path)
 
